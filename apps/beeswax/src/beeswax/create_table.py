@@ -15,12 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Views & controls for creating tables
-"""
 
-import logging
+import csv
 import gzip
+import json
+import logging
 
 from django.core.urlresolvers import reverse
 from django.utils.translation import ugettext as _
@@ -43,10 +42,11 @@ from beeswax.views import execute_directly
 
 LOG = logging.getLogger(__name__)
 
-
 def create_table(request, database='default'):
   """Create a table by specifying its attributes manually"""
   db = dbms.get(request.user)
+  dbs = db.get_databases()
+  databases = [{'name':db, 'url':reverse('beeswax:create_table', kwargs={'database': db})} for db in dbs]
 
   form = MultiForm(
       table=CreateTableForm,
@@ -64,6 +64,7 @@ def create_table(request, database='default'):
         columns = [ f.cleaned_data for f in form.columns.forms ]
         partition_columns = [ f.cleaned_data for f in form.partitions.forms ]
         proposed_query = django_mako.render_to_string("create_table_statement.mako", {
+            'databases': databases,
             'database': database,
             'table': form.table.cleaned_data,
             'columns': columns,
@@ -79,6 +80,7 @@ def create_table(request, database='default'):
 
   return render("create_table_manually.mako", request, {
     'action': "#",
+    'databases': databases,
     'table_form': form.table,
     'columns_form': form.columns,
     'partitions_form': form.partitions,
@@ -87,7 +89,7 @@ def create_table(request, database='default'):
   })
 
 
-IMPORT_PEEK_SIZE = 8192
+IMPORT_PEEK_SIZE = 5 * 1024**2
 IMPORT_PEEK_NLINES = 10
 DELIMITERS = [ hive_val for hive_val, desc, ascii in TERMINATORS ]
 DELIMITER_READABLE = {'\\001' : _('ctrl-As'),
@@ -111,6 +113,10 @@ def import_wizard(request, database='default'):
   encoding = i18n.get_site_encoding()
   app_name = get_app_name(request)
 
+  db = dbms.get(request.user)
+  dbs = db.get_databases()
+  databases = [{'name':db, 'url':reverse('beeswax:import_wizard', kwargs={'database': db})} for db in dbs]
+
   if request.method == 'POST':
     #
     # General processing logic:
@@ -128,8 +134,6 @@ def import_wizard(request, database='default'):
     delim_is_auto = False
     fields_list, n_cols = [[]], 0
     s3_col_formset = None
-
-    db = dbms.get(request.user)
     s1_file_form = CreateByImportFileForm(request.POST, db=db)
 
     if s1_file_form.is_valid():
@@ -181,6 +185,7 @@ def import_wizard(request, database='default'):
           'delimiter_choices': TERMINATOR_CHOICES,
           'n_cols': n_cols,
           'database': database,
+          'databases': databases
         })
 
       #
@@ -190,20 +195,25 @@ def import_wizard(request, database='default'):
         if s3_col_formset is None:
           columns = []
           for i in range(n_cols):
-            columns.append(dict(
-                column_name='col_%s' % (i,),
-                column_type='string',
-            ))
+            columns.append({
+                'column_name': 'col_%s' % (i,),
+                'column_type': 'string',
+            })
           s3_col_formset = ColumnTypeFormSet(prefix='cols', initial=columns)
-        return render('define_columns.mako', request, {
-          'action': reverse(app_name + ':import_wizard', kwargs={'database': database}),
-          'file_form': s1_file_form,
-          'delim_form': s2_delim_form,
-          'column_formset': s3_col_formset,
-          'fields_list': fields_list,
-          'n_cols': n_cols,
-          'database': database,
-        })
+        try:
+          return render('define_columns.mako', request, {
+            'action': reverse(app_name + ':import_wizard', kwargs={'database': database}),
+            'file_form': s1_file_form,
+            'delim_form': s2_delim_form,
+            'column_formset': s3_col_formset,
+            'fields_list': fields_list,
+            'fields_list_json': json.dumps(fields_list),
+            'n_cols': n_cols,
+            'database': database,
+            'databases': databases
+          })
+        except Exception, e:
+          raise PopupException(_("The selected delimiter is creating an un-even number of columns. Please make sure you don't have empty columns."), detail=e)
 
       #
       # Final: Execute
@@ -212,13 +222,16 @@ def import_wizard(request, database='default'):
         delim = s2_delim_form.cleaned_data['delimiter']
         table_name = s1_file_form.cleaned_data['name']
         proposed_query = django_mako.render_to_string("create_table_statement.mako", {
-            'table': dict(name=table_name,
-                          comment=s1_file_form.cleaned_data['comment'],
-                          row_format='Delimited',
-                          field_terminator=delim),
+            'table': {
+                'name': table_name,
+                'comment': s1_file_form.cleaned_data['comment'],
+                'row_format': 'Delimited',
+                'field_terminator': delim
+             },
             'columns': [ f.cleaned_data for f in s3_col_formset.forms ],
             'partition_columns': [],
             'database': database,
+            'databases': databases
           }
         )
 
@@ -232,6 +245,7 @@ def import_wizard(request, database='default'):
     'action': reverse(app_name + ':import_wizard', kwargs={'database': database}),
     'file_form': s1_file_form,
     'database': database,
+    'databases': databases
   })
 
 
@@ -359,17 +373,24 @@ def _readfields(lines, delimiters):
   res = (None, None)
 
   for delim in delimiters:
-    fields_list = [ ]
-    for line in lines:
-      if line:
-        # Unescape the delimiter back to its character value
-        fields_list.append(line.split(delim.decode('string_escape')))
+    # Unescape the delimiter back to its character value
+    delimiter = delim.decode('string_escape')
+    try:
+      fields_list = _get_rows(lines, delimiter)
+    except:
+      fields_list = [line.split(delimiter) for line in lines if line]
+
     score = score_delim(fields_list)
     LOG.debug("'%s' gives score of %s" % (delim, score))
     if score > max_score:
       max_score = score
       res = (delim, fields_list)
   return res
+
+
+def _get_rows(lines, delimiter):
+  column_reader = csv.reader(lines, delimiter=delimiter)
+  return [row for row in column_reader if row]
 
 
 def _peek_file(fs, file_form):
@@ -440,7 +461,7 @@ def load_after_create(request, database):
   LOG.debug("Auto loading data from %s into table %s" % (path, tablename))
   hql = "LOAD DATA INPATH '%s' INTO TABLE `%s.%s`" % (path, database, tablename)
   query = hql_query(hql)
-  app_name = get_app_name(request)
+
   on_success_url = reverse('metastore:describe_table', kwargs={'database': database, 'table': tablename})
 
   return execute_directly(request, query, on_success_url=on_success_url)
