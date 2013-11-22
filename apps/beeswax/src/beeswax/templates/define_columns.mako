@@ -266,6 +266,13 @@ ${ layout.metastore_menubar() }
     $("#columnNamesPopover .editable-cancel").click(function () {
       $("#columnNamesPopover").hide();
     });
+    
+    function guessColumnTypes() {
+      // Pick from 2nd column only
+      $(".dataSample").each(function () {
+        var _val = $.trim($(this).text());
+        var _field = $(this).siblings().find("select[id^=id_cols-]");
+        var _foundType = "string";
 
     function guessColumnTypes() {
       // Pick from 2nd column only
